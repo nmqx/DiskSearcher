@@ -292,84 +292,92 @@ func main() {
 
 // processLine extracts the relevant information from a matched line based on the mode.
 // It assumes the line contains the search term (for non-TikTok modes).
+// processLine extracts the desired information based on the mode.
+// It now correctly handles the user:pass format when preceded by a URL containing colons.
 func processLine(line string, config SearchConfig) string {
 	switch config.Mode {
 	case "url":
 		// Return the full line as is
 		return line
+
 	case "email":
-		// Prioritize strict email:password format using regex
-		if !strings.ContainsRune(line, '@') { // Quick check
-			return ""
-		}
-		matches := emailPassRegex.FindStringSubmatch(line)
-		if len(matches) >= 3 {
-			// Found exact email:password pattern
-			return matches[1] + ":" + matches[2]
+		// Prioritize regex for common email:pass patterns
+		if strings.ContainsRune(line, '@') { // Quick check
+			matches := emailPassRegex.FindStringSubmatch(line)
+			if len(matches) >= 3 {
+				return matches[1] + ":" + matches[2] // Group 1 is email, Group 2 is pass
+			}
 		}
 
-		// Fallback: Try simple splitting for common delimiters if regex fails
-		// Check for '|' delimiter first (common in some lists)
-		if strings.ContainsRune(line, '|') {
+		// Check for '|' separator as an alternative common format
+		if strings.ContainsRune(line, '|') && strings.ContainsRune(line, '@') {
 			parts := strings.Split(line, "|")
-			// Look for an email-like field followed by another field
 			for i, part := range parts {
 				trimmedPart := strings.TrimSpace(part)
-				if strings.ContainsRune(trimmedPart, '@') && strings.ContainsRune(trimmedPart, '.') && i+1 < len(parts) {
-					// Assume the next part is the password
-					return trimmedPart + ":" + strings.TrimSpace(parts[i+1])
+				// Check if the part looks like an email
+				if strings.ContainsRune(trimmedPart, '@') && strings.ContainsRune(trimmedPart, '.') {
+					// Ensure there's a part after it to be the password
+					if i+1 < len(parts) {
+						// Join all subsequent parts as the password (handles '|' in password)
+						password := strings.TrimSpace(strings.Join(parts[i+1:], "|"))
+						if password != "" {
+							return trimmedPart + ":" + password
+						}
+					}
+					// Found email but no password after it? Break search on this line.
+					break
 				}
 			}
 		}
 
-		// Fallback: Try ':' delimiter (most common)
-		parts := strings.Split(line, ":")
-		if len(parts) >= 2 {
-			// Look for an email-like field
-			for i, part := range parts {
-				trimmedPart := strings.TrimSpace(part)
-				// Basic check for email format
-				if strings.ContainsRune(trimmedPart, '@') && strings.ContainsRune(trimmedPart, '.') && i+1 < len(parts) {
-					// Assume the *next single* part is the password.
-					// Joining remaining parts (Join(parts[i+1:], ":")) might be too greedy if other ':' exist.
-					return trimmedPart + ":" + strings.TrimSpace(parts[i+1])
+		// Fallback: Split by colon, find the email, take subsequent parts as password
+		// This handles cases like URL:email:password or other:email:password:with:colons
+		if strings.ContainsRune(line, ':') && strings.ContainsRune(line, '@') {
+			parts := strings.Split(line, ":")
+			if len(parts) >= 2 { // Need at least email:something
+				for i, part := range parts {
+					trimmedPart := strings.TrimSpace(part)
+					// Check if it looks like an email
+					if strings.ContainsRune(trimmedPart, '@') && strings.ContainsRune(trimmedPart, '.') {
+						// Ensure there's something *after* the email part to be the password
+						if i+1 < len(parts) {
+							// Join all subsequent parts as the password (handles ':' in password)
+							password := strings.TrimSpace(strings.Join(parts[i+1:], ":"))
+							if password != "" { // Make sure password isn't empty
+								return trimmedPart + ":" + password
+							}
+						}
+						// Found email but no password after it? Break.
+						break
+					}
 				}
 			}
 		}
-		return "" // No suitable email:pass format found
+		return "" // No email:pass format found
 
 	case "user":
-		// Primarily look for colon-separated values, often user:pass or similar
-		parts := strings.SplitN(line, ":", 3) // Split into max 3 parts: potential_user:potential_pass:rest
-		if len(parts) >= 2 {                  // Need at least two parts
-			userPart := strings.TrimSpace(parts[0])
-			passPart := strings.TrimSpace(parts[1])
-			// Basic validation: Neither part should be empty. Avoid email-like usernames.
-			if userPart != "" && passPart != "" && !strings.ContainsRune(userPart, '@') {
-				// Return the first two parts as user:pass
-				return userPart + ":" + passPart
-				// Alternative: If password might contain colons:
-				// return userPart + ":" + strings.TrimSpace(strings.Join(parts[1:], ":"))
+		// Handles formats like someprefix:username:password or url:username:password[:password_with_colons]
+		parts := strings.Split(line, ":")
+		if len(parts) >= 3 { // Need at least prefix:user:pass
+			// Assume the second-to-last part is the user/credential
+			user := strings.TrimSpace(parts[len(parts)-2])
+			// Assume everything from the last part onwards is the password
+			password := strings.TrimSpace(strings.Join(parts[len(parts)-1:], ":"))
+
+			// Basic validation: user shouldn't be empty, password shouldn't be empty
+			// Avoid extracting things like "https://domain.com:443:password" as user "443"
+			// A simple heuristic: user shouldn't typically contain '/' if it's meant to be a username.
+			// This isn't perfect but helps filter common URL parts.
+			// Also, skip if the 'user' part contains '@' as that's likely an email.
+			if user != "" && password != "" && !strings.ContainsRune(user, '/') && !strings.ContainsRune(user, '@') {
+				return user + ":" + password
 			}
 		}
+		return "" // Didn't match the expected structure
 
-		// Fallback: Try '|' delimiter if ':' didn't yield a result
-		if strings.ContainsRune(line, '|') {
-			parts = strings.SplitN(line, "|", 3)
-			if len(parts) >= 2 {
-				userPart := strings.TrimSpace(parts[0])
-				passPart := strings.TrimSpace(parts[1])
-				if userPart != "" && passPart != "" && !strings.ContainsRune(userPart, '@') {
-					return userPart + ":" + passPart
-				}
-			}
-		}
-		return "" // No suitable user:pass format found
-
-	// NOTE: "tiktok" mode results are pre-formatted before reaching the writer goroutine.
+	// NOTE: "tiktok" mode is handled BEFORE calling this function in the writer goroutine.
 	default:
-		// Should not happen due to mode validation in main()
-		fmt.Fprintf(os.Stderr, "Error: Unknown mode '%s' in processLine\n", config.Mode)
+		// Should not happen due to initial validation
 		return ""
 	}
 }
